@@ -1,12 +1,12 @@
 # unreal-mcp-crowd-gotchas
 
 Notes from building a crowd cinematic in UE 5.8 — MetaHuman Crowd + an AI
-agent (Claude Code) driving the editor over Unreal's MCP plugin. Two things
-nearly killed the workflow, neither documented anywhere obvious. Written up
-here in case it saves someone else the afternoon it cost me.
+agent (Claude Code) driving the editor over Unreal's MCP plugin. Three things
+nearly killed the workflow, none documented anywhere obvious. Written up here
+in case it saves someone else the afternoon it cost me.
 
-This repo is free, standalone reference — a config snippet plus the two
-write-ups below. No project files, no product, just the notes.
+This repo is free, standalone reference — a config snippet plus the write-up
+below. No project files, no product, just the notes.
 
 ---
 
@@ -66,33 +66,38 @@ should end up with.
 
 ---
 
-## Trap 2: your crowd spawns zero agents, and raising the count does nothing
+## Trap 2: crowd spawning fails with zero agents, zero errors — and a decoy actor sends you the wrong way
 
 This one's specific to MetaHuman Crowd (the Mass-framework-based crowd system
 — not City Sample Crowds, which is a separate, older system).
 
 Symptom: you've migrated the StarterKit content, wired up a
 `MetaHumanMassSpawner`, hit Play — and nothing spawns. Not "a few" agents.
-Zero. Raising the spawner's `count` from 12 to 30 changes nothing.
+Zero. No error, no warning, nothing in the log. Raising the spawner's `count`
+from 12 to 30 changes nothing.
 
-**Root cause: there's no navmesh in the level.** MetaHuman Crowd spawns
-through an EQS query (`MassEntityEQSSpawnPointsGenerator`) that projects
-candidate spawn points onto the navmesh. No navmesh means the query returns
-zero points, which means zero entities — regardless of what `count` says.
-Count was never the variable.
+First instinct is to check for a navmesh. That's when it gets actively
+misleading: querying the level for anything with "Nav" in the name *returns
+a hit* — `AbstractNavData-Default`. Looks promising. It's a decoy: that's
+Unreal's internal null/fallback nav data, not a real navmesh, and a naive
+"is there a Nav actor here?" check will tell you everything's fine when it
+isn't.
 
-The trap inside the trap: it's easy to *think* you have a navmesh and be
-wrong. `find_actors(name: "Nav")` can return something like
-`AbstractNavData-Default` — that's the engine's null/fallback nav data, not
-an actual navmesh. Check specifically for a `RecastNavMesh` actor.
+**Root cause:** MetaHuman Crowd spawns through an EQS query
+(`MassEntityEQSSpawnPointsGenerator`) that projects candidate spawn points
+onto an actual navmesh. No real navmesh → the query returns zero points →
+zero entities spawn, with nothing surfaced anywhere to tell you that's what
+happened. Count was never the variable.
 
-**The fix:**
+**The fix — and the part that's genuinely undocumented:**
 1. Add a `NavMeshBoundsVolume` covering your crowd area.
-2. This auto-creates a `RecastNavMesh-Default` actor.
-3. Set its **`RuntimeGeneration` to `Dynamic`** (default is `Static`), so the
-   navmesh builds at `BeginPlay` — this matters because it's what makes
-   spawning work in both PIE and Movie Render Queue without depending on a
-   saved editor bake.
+2. This auto-creates a real `RecastNavMesh-Default` actor.
+3. Its `RuntimeGeneration` defaults to **`Static`** — meaning it only builds
+   from a saved editor bake. Leave it there and the crowd can *still* spawn
+   zero agents in Play mode or in a render, even with a real navmesh now
+   sitting in the level, because nothing ever triggered a build. Flip it to
+   **`Dynamic`** so it builds at `BeginPlay`, and it works in both PIE and
+   Movie Render Queue without depending on that bake.
 
 **Other things that will bite you once agents are actually spawning:**
 
@@ -109,17 +114,34 @@ an actual navmesh. Check specifically for a `RecastNavMesh` actor.
   whatever trait sounds speed-related (steering reaction time, spring
   smoothing) and find nothing. Base speed lives in the movement trait's
   `defaultDesiredSpeed` / `maxSpeed`.
-- **The AI wander radius is hardcoded in the StateTree asset and isn't
-  exposed as a settable property** through the scripting/tool API — if your
-  agents are only ever taking tiny hops, that's why. It's editable by hand in
-  the StateTree editor (find the task with "search radius" on it), just not
-  programmatically.
 - **Movie Render Queue is disabled by default too**, separately from the MCP
   toolset gap above — if it's missing from your Window menu, check
   `MovieRenderPipeline` is enabled in Plugins (restart required). And budget
   warmup frames in the render job: agents spawn at `BeginPlay` and need time
   to disperse before the "real" footage starts, or your opening frames show
   everyone still clumped at the spawn point.
+
+---
+
+## Trap 3: the wander radius is compiled into a behavior asset, with no API to touch it
+
+Once agents are actually walking, the next question is how far they roam —
+and that number isn't a spawner property, isn't on the movement trait, and
+won't show up in a normal property dump.
+
+It's a single field, **Search Radius**, buried inside a task node inside a
+StateTree behavior asset — the crowd's wander AI graph. And the tool API for
+StateTree assets is **read-only**: it exposes `get_root_states`,
+`get_children`, `get_tasks`, and similar — no `set_*` equivalent anywhere.
+You can inspect the value programmatically. You cannot change it that way.
+
+The only way to adjust it: open the StateTree asset in its own graph editor,
+select the specific child state holding the "Find Reachable Point" task (not
+its sibling "Stand" state), click into that task, and edit **Search Radius**
+directly in the Details panel. If your crowd is only ever taking tiny hops
+and staying clustered near spawn, this is almost certainly why — and it's
+worth knowing before you go looking for a config value to bump, because there
+isn't one to find through the tooling.
 
 ---
 
